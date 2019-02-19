@@ -1,7 +1,8 @@
 use failure::ResultExt;
 use relative_path::RelativePathBuf;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
     fs::File,
     path::{Path, PathBuf},
 };
@@ -17,17 +18,28 @@ pub enum Task<'a> {
 }
 
 impl<'a> Task<'a> {
-    fn run(self) -> Result<(), failure::Error> {
-        match self {
-            Task::Process(path, dest, replace) => {
-                process_single(&path, &dest, replace).with_context(|_| {
-                    failure::format_err!("failed to process: {}", path.display())
-                })?;
+    fn run(&self) -> Result<(), failure::Error> {
+        match *self {
+            Task::Process(ref path, ref dest, replace) => {
+                process_single(&path, &dest, replace)?;
             }
-            Task::ProcessSilent(path, dest) => {
-                process_silent(&path, &dest).with_context(|_| {
-                    failure::format_err!("failed to process to silence: {}", path.display())
-                })?;
+            Task::ProcessSilent(ref path, ref dest) => {
+                process_silent(&path, &dest)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a> fmt::Display for Task<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Task::Process(ref path, ref dest, ..) => {
+                write!(fmt, "process {} -> {}", path.display(), dest.display())?;
+            }
+            Task::ProcessSilent(ref path, ref dest) => {
+                write!(fmt, "silence {} -> {}", path.display(), dest.display())?;
             }
         }
 
@@ -188,6 +200,13 @@ fn opts() -> clap::App<'static, 'static> {
                 .long("list")
                 .help("List files which will be muted since they don't have a configuration."),
         )
+        .arg(
+            clap::Arg::with_name("oiv-manifest")
+                .long("oiv-manifest")
+                .value_name("<file>")
+                .help("Where to write the GTAV .oiv manifest.")
+                .takes_value(true),
+        )
 }
 
 /// Process a single file and apply all the specified replacements.
@@ -196,9 +215,12 @@ fn process_single(
     dest_path: &Path,
     replaces: &[Replace],
 ) -> Result<(), failure::Error> {
-    if replaces.is_empty() {
-        // Nothing to replace.
-        return Ok(());
+    let dest_parent = dest_path
+        .parent()
+        .ok_or_else(|| failure::format_err!("expected destination to have parent dir"))?;
+
+    if !dest_parent.is_dir() {
+        std::fs::create_dir_all(dest_parent)?;
     }
 
     if dest_path.is_file() {
@@ -248,6 +270,14 @@ fn process_silent(path: &Path, dest_path: &Path) -> Result<(), failure::Error> {
         return Ok(());
     }
 
+    let dest_parent = dest_path
+        .parent()
+        .ok_or_else(|| failure::format_err!("expected destination to have parent dir"))?;
+
+    if !dest_parent.is_dir() {
+        std::fs::create_dir_all(dest_parent)?;
+    }
+
     let r = File::open(path)?;
     let r = hound::WavReader::new(r)
         .with_context(|_| failure::format_err!("failed to open file: {}", path.display()))?;
@@ -264,6 +294,126 @@ fn process_silent(path: &Path, dest_path: &Path) -> Result<(), failure::Error> {
 
     writer.flush()?;
     Ok(())
+}
+
+/// Write out the .oiv manifest for GTA V.
+fn write_oiv_manifest(
+    modified: &BTreeSet<RelativePathBuf>,
+    output: Option<&Path>,
+) -> Result<(), failure::Error> {
+    use std::{collections::btree_map::Entry, io::Write};
+
+    let mut archives = BTreeMap::new();
+
+    for m in modified {
+        let mut c = m.components();
+        let rpf = c.next().expect("expected root").as_str();
+
+        let archive = match archives.entry(rpf.clone()) {
+            Entry::Vacant(e) => e.insert(Archive {
+                path: format!("x64/audio/sfx/{}.rpf", rpf),
+                create_if_not_exists: "True",
+                ty: String::from("RPF7"),
+                add: Vec::new(),
+            }),
+            Entry::Occupied(e) => e.into_mut(),
+        };
+
+        let audio_file = c.next().expect("expected audio file").as_str();
+
+        archive.add.push(Add {
+            source: format!("{}.awc", m.display()),
+            value: format!("{}.awc", audio_file),
+        });
+    }
+
+    let mut content = Content::default();
+    content.archives.extend(archives.into_iter().map(|v| v.1));
+
+    match output {
+        Some(output) => {
+            let mut f = File::create(output)?;
+            write!(f, "{}", content)?;
+        }
+        None => {
+            println!("{}", content);
+        }
+    }
+
+    return Ok(());
+
+    #[derive(Debug)]
+    struct Add {
+        source: String,
+        value: String,
+    }
+
+    impl Add {
+        pub fn to_xml(&self, fmt: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+            let prefix = std::iter::repeat(' ').take(depth).collect::<String>();
+
+            writeln!(
+                fmt,
+                "{}<add source=\"{}\">{}</add>",
+                prefix, self.source, self.value
+            )?;
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct Archive {
+        path: String,
+        create_if_not_exists: &'static str,
+        ty: String,
+        add: Vec<Add>,
+    }
+
+    impl Archive {
+        pub fn to_xml(&self, fmt: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+            let prefix = std::iter::repeat(' ').take(depth).collect::<String>();
+
+            writeln!(
+                fmt,
+                "{}<archive path=\"{}\" createIfNotExists=\"{}\" type=\"{}\">",
+                prefix, self.path, self.create_if_not_exists, self.ty
+            )?;
+
+            for a in &self.add {
+                a.to_xml(fmt, depth + 2)?;
+            }
+
+            writeln!(fmt, "{}</archive>", prefix)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Content {
+        archives: Vec<Archive>,
+    }
+
+    impl Content {
+        pub fn to_xml(&self, fmt: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+            let prefix = std::iter::repeat(' ').take(depth).collect::<String>();
+
+            writeln!(fmt, "{}<content>", prefix)?;
+
+            for a in &self.archives {
+                a.to_xml(fmt, depth + 2)?;
+            }
+
+            writeln!(fmt, "{}</content>", prefix)?;
+            Ok(())
+        }
+    }
+
+    impl fmt::Display for Content {
+        fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.to_xml(fmt, 0)
+        }
+    }
 }
 
 fn main() -> Result<(), failure::Error> {
@@ -323,6 +473,9 @@ fn main() -> Result<(), failure::Error> {
 
     let mut tasks = Vec::new();
 
+    // keep track if we are processing any files, which will determine what goes into the manifest.
+    let mut modified = BTreeSet::new();
+
     for (root, config_path, config) in &configs {
         let output = root.join("output");
 
@@ -339,21 +492,18 @@ fn main() -> Result<(), failure::Error> {
                 dest_root.push(c.as_str());
             }
 
-            if !dest_root.is_dir() {
-                std::fs::create_dir_all(&dest_root)?;
-            }
-
-            let mut index = BTreeSet::new();
+            let mut index = BTreeMap::new();
 
             for result in ignore::Walk::new(&root) {
-                let path = result?.path().to_owned();
+                let result = result?;
+                let path = result.path().to_owned();
 
                 match path.extension().and_then(|s| s.to_str()) {
                     Some("wav") => {}
                     _ => continue,
                 }
 
-                index.insert(path);
+                index.insert(path, &dir.path);
             }
 
             for f in &dir.files {
@@ -385,7 +535,7 @@ fn main() -> Result<(), failure::Error> {
 
                 let path = path.to_path(&root);
 
-                if !index.remove(&path) {
+                if index.remove(&path).is_none() {
                     failure::bail!("did not expect to censor file: {}", path.display());
                 }
 
@@ -394,18 +544,31 @@ fn main() -> Result<(), failure::Error> {
                         .ok_or_else(|| failure::format_err!("expected file name"))?,
                 );
 
+                // audio file already clean.
+                if f.replace.is_empty() {
+                    continue;
+                }
+
+                modified.insert(dir.path.to_owned());
                 tasks.push(Task::Process(path, dest, &f.replace))
             }
 
             if !index.is_empty() {
-                println!(
-                    "missing censor configuration for {} file(s) (--list to see them)",
-                    index.len()
-                );
+                if !list {
+                    eprintln!(
+                        "{}: missing censor configuration for {} file(s) (--list to see them)",
+                        config_path.display(),
+                        index.len()
+                    );
+                }
 
-                for path in index {
+                for (path, file) in index {
                     if list {
-                        println!("{}: {}", config_path.display(), path.display());
+                        eprintln!(
+                            "{}: missing config for: {}",
+                            config_path.display(),
+                            path.display()
+                        );
                     }
 
                     let dest = dest_root.join(
@@ -414,6 +577,7 @@ fn main() -> Result<(), failure::Error> {
                             .ok_or_else(|| failure::format_err!("expected file name"))?,
                     );
 
+                    modified.insert(file.to_owned());
                     tasks.push(Task::ProcessSilent(path, dest));
                 }
             }
@@ -422,8 +586,20 @@ fn main() -> Result<(), failure::Error> {
 
     tasks
         .into_par_iter()
-        .map(|t| t.run())
+        .map(|t| {
+            t.run()
+                .with_context(|_| failure::format_err!("failed to run: {}", t))
+        })
         .collect::<Result<(), _>>()?;
+
+    if let Some(oiv_manifest) = m.value_of("oiv-manifest") {
+        let out = match oiv_manifest {
+            "-" => None,
+            other => Some(Path::new(other)),
+        };
+
+        write_oiv_manifest(&modified, out)?;
+    }
 
     Ok(())
 }
