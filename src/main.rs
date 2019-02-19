@@ -201,6 +201,11 @@ fn opts() -> clap::App<'static, 'static> {
                 .help("List files which will be muted since they don't have a configuration."),
         )
         .arg(
+            clap::Arg::with_name("stats")
+                .long("stats")
+                .help("Show statistics about all configurations loaded."),
+        )
+        .arg(
             clap::Arg::with_name("oiv-manifest")
                 .long("oiv-manifest")
                 .value_name("<file>")
@@ -421,6 +426,9 @@ fn main() -> Result<(), failure::Error> {
 
     let m = opts().get_matches();
     let list = m.is_present("list");
+    let stats = m.is_present("stats");
+
+    let mut counts = BTreeMap::<String, u64>::new();
 
     let mut configs = Vec::new();
     configs.extend(
@@ -550,7 +558,13 @@ fn main() -> Result<(), failure::Error> {
                 }
 
                 modified.insert(dir.path.to_owned());
-                tasks.push(Task::Process(path, dest, &f.replace))
+                tasks.push(Task::Process(path, dest, &f.replace));
+
+                if stats {
+                    for r in &f.replace {
+                        *counts.entry(r.kind.clone()).or_default() += 1;
+                    }
+                }
             }
 
             if !index.is_empty() {
@@ -584,13 +598,21 @@ fn main() -> Result<(), failure::Error> {
         }
     }
 
-    tasks
-        .into_par_iter()
-        .map(|t| {
-            t.run()
-                .with_context(|_| failure::format_err!("failed to run: {}", t))
-        })
-        .collect::<Result<(), _>>()?;
+    if stats {
+        println!("# Statistics (--stats)");
+
+        for (word, count) in counts {
+            println!("{} - {}", word, count);
+        }
+    } else {
+        tasks
+            .into_par_iter()
+            .map(|t| {
+                t.run()
+                    .with_context(|_| failure::format_err!("failed to run: {}", t))
+            })
+            .collect::<Result<(), _>>()?;
+    }
 
     if let Some(oiv_manifest) = m.value_of("oiv-manifest") {
         let out = match oiv_manifest {
