@@ -51,13 +51,17 @@ pub struct ReplaceFile {
 #[derive(Debug, serde::Deserialize)]
 pub struct ReplaceDir {
     path: RelativePathBuf,
+    #[serde(default)]
     file_prefix: Option<String>,
+    #[serde(default)]
     file_extension: Option<String>,
+    #[serde(default)]
     files: Vec<ReplaceFile>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
+    #[serde(default)]
     dirs: Vec<ReplaceDir>,
 }
 
@@ -158,6 +162,15 @@ fn opts() -> clap::App<'static, 'static> {
                 .long("config")
                 .value_name("<file>")
                 .help("Configuration file to use.")
+                .multiple(true)
+                .takes_value(true),
+        )
+        .arg(
+            clap::Arg::with_name("config-dir")
+                .short("d")
+                .long("config-dir")
+                .value_name("<dir>")
+                .help("Configuration directory to use.")
                 .takes_value(true),
         )
         .arg(
@@ -196,7 +209,7 @@ fn process_single(
     let r = hound::WavReader::new(r)
         .with_context(|_| failure::format_err!("failed to open file: {}", path.display()))?;
     let s = r.spec();
-    let duration = r.duration() as usize;
+    let duration = r.duration();
 
     let mut data = r.into_samples::<i16>().collect::<Result<Vec<i16>, _>>()?;
 
@@ -207,7 +220,7 @@ fn process_single(
 
         let mut end = range.end.as_samples(s.sample_rate) as usize;
         end *= s.channels as usize;
-        end = usize::min(end, duration);
+        end = usize::min(end, duration as usize);
 
         let zeros = (start..end).map(|_| i16::default()).collect::<Vec<_>>();
         (&mut data[start..end]).copy_from_slice(&zeros);
@@ -216,10 +229,13 @@ fn process_single(
     let d = File::create(&dest_path)?;
     let mut w = hound::WavWriter::new(d, s)?;
 
-    for s in data {
-        w.write_sample(s)?;
+    let mut writer = w.get_i16_writer(data.len() as u32);
+
+    for d in data {
+        writer.write_sample(d);
     }
 
+    writer.flush()?;
     Ok(())
 }
 
@@ -235,18 +251,16 @@ fn process_silent(path: &Path, dest_path: &Path) -> Result<(), failure::Error> {
         .with_context(|_| failure::format_err!("failed to open file: {}", path.display()))?;
     let s = r.spec();
 
-    let data = r
-        .into_samples::<i16>()
-        .map(|r| r.map(|_| Default::default()))
-        .collect::<Result<Vec<i16>, _>>()?;
-
     let d = File::create(&dest_path)?;
     let mut w = hound::WavWriter::new(d, s)?;
 
-    for s in data {
-        w.write_sample(s)?;
+    let mut writer = w.get_i16_writer(r.duration());
+
+    for _ in 0..(r.duration() * s.channels as u32) {
+        writer.write_sample(0i16);
     }
 
+    writer.flush()?;
     Ok(())
 }
 
@@ -255,106 +269,146 @@ fn main() -> Result<(), failure::Error> {
 
     let m = opts().get_matches();
     let list = m.is_present("list");
-    let config_path = Path::new(m.value_of("config").unwrap_or("BatchCensor.yml"));
 
-    let f = File::open(config_path).with_context(|_| {
-        failure::format_err!("could not open configuration: {}", config_path.display())
-    })?;
+    let mut configs = Vec::new();
+    configs.extend(
+        m.values_of("config")
+            .into_iter()
+            .flat_map(|c| c)
+            .map(PathBuf::from),
+    );
 
-    let config: Config = serde_yaml::from_reader(f)?;
+    if let Some(config_dir) = m.value_of("config-dir") {
+        for result in ignore::Walk::new(config_dir) {
+            let result = result?;
+            let path = result.path();
 
-    let root = match m.value_of("root").map(Path::new) {
-        Some(root) => root,
-        None => config_path
-            .parent()
-            .ok_or_else(|| failure::format_err!("config does not have a parent directory"))?,
-    };
-
-    let mut tasks = Vec::new();
-
-    for dir in &config.dirs {
-        let root = dir.path.to_path(&root);
-
-        let stem = root
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| failure::format_err!("expected file stem"))?;
-        let dest_root = root
-            .parent()
-            .ok_or_else(|| failure::format_err!("missing parent directory"))?;
-        let dest_root = dest_root.join(format!("{}-censored", stem));
-
-        if !dest_root.is_dir() {
-            std::fs::create_dir_all(&dest_root)?;
-        }
-
-        let mut index = BTreeSet::new();
-
-        for result in ignore::Walk::new(&root) {
-            let path = result?.path().to_owned();
+            if !path.is_file() {
+                continue;
+            }
 
             match path.extension().and_then(|s| s.to_str()) {
-                Some("wav") => {}
+                Some("yml") => {}
                 _ => continue,
             }
 
-            index.insert(path);
+            configs.push(path.to_owned());
         }
+    }
 
-        for f in &dir.files {
-            // temp storage for modified path.
-            let mut replaced;
-            let mut path = &f.path;
+    let default_root = m.value_of("root").map(Path::new);
 
-            if let Some(file_prefix) = dir.file_prefix.as_ref() {
-                let name = match path.file_name() {
-                    Some(existing) => format!("{}{}", file_prefix, existing),
-                    None => file_prefix.to_string(),
-                };
+    let configs = configs
+        .iter()
+        .map(|path| {
+            let f = File::open(path).with_context(|_| {
+                failure::format_err!("could not open configuration: {}", path.display())
+            })?;
 
-                let new_path = path.with_file_name(name);
-                replaced = None;
-                path = replaced.get_or_insert(new_path);
+            let config: Config = serde_yaml::from_reader(f)
+                .with_context(|_| failure::format_err!("failed to parse: {}", path.display()))?;
+
+            let root = match default_root {
+                Some(root) => root,
+                None => path.parent().ok_or_else(|| {
+                    failure::format_err!("config does not have a parent directory")
+                })?,
+            };
+
+            Ok((root, path, config))
+        })
+        .collect::<Result<Vec<_>, failure::Error>>()?;
+
+    let mut tasks = Vec::new();
+
+    for (root, config_path, config) in &configs {
+        let output = root.join("output");
+
+        for dir in &config.dirs {
+            let root = dir.path.to_path(&root);
+
+            if !root.is_dir() {
+                failure::bail!("no such directory: {}", root.display());
             }
 
-            if let Some(file_extension) = dir.file_extension.as_ref() {
-                let new_path = path.with_extension(file_extension);
-                replaced = None;
-                path = replaced.get_or_insert(new_path);
+            let mut dest_root = output.to_owned();
+
+            for c in dir.path.components() {
+                dest_root.push(c.as_str());
             }
 
-            let path = path.to_path(&root);
-
-            if !index.remove(&path) {
-                failure::bail!("did not expect to censor file: {}", path.display());
+            if !dest_root.is_dir() {
+                std::fs::create_dir_all(&dest_root)?;
             }
 
-            let dest = dest_root.join(
-                path.file_name()
-                    .ok_or_else(|| failure::format_err!("expected file name"))?,
-            );
+            let mut index = BTreeSet::new();
 
-            tasks.push(Task::Process(path, dest, &f.replace))
-        }
+            for result in ignore::Walk::new(&root) {
+                let path = result?.path().to_owned();
 
-        if !index.is_empty() {
-            println!(
-                "missing censor configuration for {} file(s) (--list to see them)",
-                index.len()
-            );
+                match path.extension().and_then(|s| s.to_str()) {
+                    Some("wav") => {}
+                    _ => continue,
+                }
 
-            for path in index {
-                if list {
-                    println!("{}", path.display());
+                index.insert(path);
+            }
+
+            for f in &dir.files {
+                // temp storage for modified path.
+                let mut replaced;
+                let mut path = &f.path;
+
+                if let Some(file_prefix) = dir.file_prefix.as_ref() {
+                    let name = match path.file_name() {
+                        Some(existing) => format!("{}{}", file_prefix, existing),
+                        None => file_prefix.to_string(),
+                    };
+
+                    let new_path = path.with_file_name(name);
+                    replaced = None;
+                    path = replaced.get_or_insert(new_path);
+                }
+
+                if let Some(file_extension) = dir.file_extension.as_ref() {
+                    let new_path = path.with_extension(file_extension);
+                    replaced = None;
+                    path = replaced.get_or_insert(new_path);
+                }
+
+                let path = path.to_path(&root);
+
+                if !index.remove(&path) {
+                    failure::bail!("did not expect to censor file: {}", path.display());
                 }
 
                 let dest = dest_root.join(
                     path.file_name()
-                        .and_then(|n| n.to_str())
                         .ok_or_else(|| failure::format_err!("expected file name"))?,
                 );
 
-                tasks.push(Task::ProcessSilent(path, dest));
+                tasks.push(Task::Process(path, dest, &f.replace))
+            }
+
+            if !index.is_empty() {
+                println!(
+                    "missing censor configuration for {} file(s) (--list to see them)",
+                    index.len()
+                );
+
+                for path in index {
+                    if list {
+                        println!("{}: {}", config_path.display(), path.display());
+                    }
+
+                    let dest = dest_root.join(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .ok_or_else(|| failure::format_err!("expected file name"))?,
+                    );
+
+                    tasks.push(Task::ProcessSilent(path, dest));
+                }
             }
         }
     }

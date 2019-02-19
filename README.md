@@ -4,7 +4,7 @@ This is a small utility to read a configuration file with audio files to censor,
 
 ## Configurations
 
-See this [Google Drive](https://drive.google.com/drive/folders/1wRlPdnIT610a6svha-YOntW_iyAY918q?usp=sharing).
+See the [batchcensor-configs](https://github.com/udoprog/batchcensor-configs) project.
 
 ## Example Configuration
 
