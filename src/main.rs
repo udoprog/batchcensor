@@ -62,6 +62,8 @@ pub struct ReplaceDir {
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
     #[serde(default)]
+    file_extension: Option<String>,
+    #[serde(default)]
     dirs: Vec<ReplaceDir>,
 }
 
@@ -355,6 +357,11 @@ fn main() -> Result<(), failure::Error> {
             }
 
             for f in &dir.files {
+                let file_extension = dir
+                    .file_extension
+                    .as_ref()
+                    .or(config.file_extension.as_ref());
+
                 // temp storage for modified path.
                 let mut replaced;
                 let mut path = &f.path;
@@ -370,7 +377,7 @@ fn main() -> Result<(), failure::Error> {
                     path = replaced.get_or_insert(new_path);
                 }
 
-                if let Some(file_extension) = dir.file_extension.as_ref() {
+                if let Some(file_extension) = file_extension {
                     let new_path = path.with_extension(file_extension);
                     replaced = None;
                     path = replaced.get_or_insert(new_path);
