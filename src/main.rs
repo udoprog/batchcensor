@@ -235,10 +235,6 @@ fn opts() -> clap::App<'static, 'static> {
 
 /// Copy a single file.
 fn process_copy(path: &Path, dest: &Path) -> Result<(), failure::Error> {
-    if dest.is_file() {
-        return Ok(());
-    }
-
     let dest_parent = dest
         .parent()
         .ok_or_else(|| failure::format_err!("expected destination to have parent dir"))?;
@@ -418,7 +414,7 @@ fn write_oiv_manifest(
 
             writeln!(
                 fmt,
-                "{}<archive path=\"{}\" createIfNotExists=\"{}\" type=\"{}\">",
+                "{}<archive path=\"{}\" createIfNotExist=\"{}\" type=\"{}\">",
                 prefix, self.path, self.create_if_not_exists, self.ty
             )?;
 
@@ -664,13 +660,20 @@ fn main() -> Result<(), failure::Error> {
             println!("{} - {}", word, count);
         }
     } else {
+        let pb = indicatif::ProgressBar::new(tasks.len() as u64);
+
         tasks
             .into_par_iter()
             .map(|t| {
-                t.run()
-                    .with_context(|_| failure::format_err!("failed to run: {}", t))
+                let r = t
+                    .run()
+                    .with_context(|_| failure::format_err!("failed to run: {}", t));
+                pb.inc(1);
+                r
             })
             .collect::<Result<(), _>>()?;
+
+        pb.finish();
     }
 
     if let Some(oiv_manifest) = m.value_of("oiv-manifest") {
