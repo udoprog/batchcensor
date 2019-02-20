@@ -2,6 +2,19 @@
 
 This is a small utility to read a configuration file with audio files to censor, and apply a censoring policy to them.
 
+## Installation
+
+First you'll need Rust.
+
+Afterwards you can install batchcensor using `cargo`:
+
+```bash
+cargo install batchcensor
+```
+
+Make sure that your `.cargo/bin` directory is in your `PATH`.
+On Windows this would be: `C:\Users\<username>\.cargo\bin`.
+
 ## Configurations
 
 See the [batchcensor-configs](https://github.com/udoprog/batchcensor-configs) project.
