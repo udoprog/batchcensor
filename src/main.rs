@@ -64,6 +64,9 @@ pub struct Replace {
 #[derive(Debug, serde::Deserialize)]
 pub struct ReplaceFile {
     path: RelativePathBuf,
+    /// Transcript of the recording.
+    transcript: Option<String>,
+    /// Replacements. If empty, file is clean.
     #[serde(default)]
     replace: Vec<Replace>,
 }
