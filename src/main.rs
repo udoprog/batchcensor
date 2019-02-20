@@ -11,6 +11,8 @@ const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 /// A single task that can be executed.
 pub enum Task<'a> {
+    /// Copy a single file.
+    Copy(PathBuf, PathBuf),
     /// Regular processing with replacements.
     Process(PathBuf, PathBuf, &'a [Replace]),
     // Silent processing.
@@ -20,6 +22,9 @@ pub enum Task<'a> {
 impl<'a> Task<'a> {
     fn run(&self) -> Result<(), failure::Error> {
         match *self {
+            Task::Copy(ref path, ref dest) => {
+                process_copy(path, dest)?;
+            }
             Task::Process(ref path, ref dest, replace) => {
                 process_single(&path, &dest, replace)?;
             }
@@ -35,6 +40,9 @@ impl<'a> Task<'a> {
 impl<'a> fmt::Display for Task<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Task::Copy(ref path, ref dest) => {
+                write!(fmt, "copy {} -> {}", path.display(), dest.display())?;
+            }
             Task::Process(ref path, ref dest, ..) => {
                 write!(fmt, "process {} -> {}", path.display(), dest.display())?;
             }
@@ -196,6 +204,14 @@ fn opts() -> clap::App<'static, 'static> {
                 .takes_value(true),
         )
         .arg(
+            clap::Arg::with_name("output")
+                .short("o")
+                .long("output")
+                .value_name("<dir>")
+                .help("Where to build output.")
+                .takes_value(true),
+        )
+        .arg(
             clap::Arg::with_name("list")
                 .long("list")
                 .help("List files which will be muted since they don't have a configuration."),
@@ -212,6 +228,24 @@ fn opts() -> clap::App<'static, 'static> {
                 .help("Where to write the GTAV .oiv manifest.")
                 .takes_value(true),
         )
+}
+
+/// Copy a single file.
+fn process_copy(path: &Path, dest: &Path) -> Result<(), failure::Error> {
+    if dest.is_file() {
+        return Ok(());
+    }
+
+    let dest_parent = dest
+        .parent()
+        .ok_or_else(|| failure::format_err!("expected destination to have parent dir"))?;
+
+    if !dest_parent.is_dir() {
+        std::fs::create_dir_all(dest_parent)?;
+    }
+
+    std::fs::copy(path, dest)?;
+    Ok(())
 }
 
 /// Process a single file and apply all the specified replacements.
@@ -449,7 +483,7 @@ fn main() -> Result<(), failure::Error> {
 
             match path.extension().and_then(|s| s.to_str()) {
                 Some("yml") => {}
-                _ => continue,
+                _ => {}
             }
 
             configs.push(path.to_owned());
@@ -485,7 +519,10 @@ fn main() -> Result<(), failure::Error> {
     let mut modified = BTreeSet::new();
 
     for (root, config_path, config) in &configs {
-        let output = root.join("output");
+        let output = match m.value_of("output") {
+            Some(output) => PathBuf::from(output),
+            None => root.join("output"),
+        };
 
         for dir in &config.dirs {
             let root = dir.path.to_path(&root);
@@ -500,15 +537,33 @@ fn main() -> Result<(), failure::Error> {
                 dest_root.push(c.as_str());
             }
 
+            // copy corresponding .oac file if present.
+            {
+                let oac = root.with_extension("oac");
+
+                if oac.is_file() {
+                    tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
+                }
+            }
+
             let mut index = BTreeMap::new();
 
             for result in ignore::Walk::new(&root) {
                 let result = result?;
                 let path = result.path().to_owned();
 
+                if !path.is_file() {
+                    continue;
+                }
+
                 match path.extension().and_then(|s| s.to_str()) {
                     Some("wav") => {}
-                    _ => continue,
+                    _ => {
+                        let dest = dest_root.join(path.strip_prefix(&root)?);
+                        // NB: straight up copy other files.
+                        tasks.push(Task::Copy(path, dest));
+                        continue;
+                    }
                 }
 
                 index.insert(path, &dir.path);
@@ -554,6 +609,7 @@ fn main() -> Result<(), failure::Error> {
 
                 // audio file already clean.
                 if f.replace.is_empty() {
+                    tasks.push(Task::Copy(path, dest));
                     continue;
                 }
 
