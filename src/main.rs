@@ -210,18 +210,18 @@ impl Range {
     /// Deserialize stringa as a position.
     pub fn parse(s: &str) -> Option<Range> {
         let mut main = s.split('-');
-        let start = pos(main.next())?;
-        let end = pos(main.next())?;
+        let start = pos(main.next(), "^")?;
+        let end = pos(main.next(), "$")?;
 
         return Some(Range { start, end });
 
-        fn pos(pos: Option<&str>) -> Option<Option<Pos>> {
+        fn pos(pos: Option<&str>, term: &str) -> Option<Option<Pos>> {
             let pos = match pos {
                 Some(pos) => pos,
                 None => return None,
             };
 
-            if pos == "" {
+            if pos == term {
                 return Some(None);
             }
 
@@ -251,7 +251,7 @@ fn opts() -> clap::App<'static, 'static> {
             clap::Arg::with_name("config")
                 .short("c")
                 .long("config")
-                .value_name("<file>")
+                .value_name("file")
                 .help("Configuration file to use.")
                 .multiple(true)
                 .takes_value(true),
@@ -260,7 +260,7 @@ fn opts() -> clap::App<'static, 'static> {
             clap::Arg::with_name("config-dir")
                 .short("d")
                 .long("config-dir")
-                .value_name("<dir>")
+                .value_name("dir")
                 .help("Configuration directory to use.")
                 .takes_value(true),
         )
@@ -268,7 +268,7 @@ fn opts() -> clap::App<'static, 'static> {
             clap::Arg::with_name("root")
                 .short("r")
                 .long("root")
-                .value_name("<dir>")
+                .value_name("dir")
                 .help("Root of project to process.")
                 .takes_value(true),
         )
@@ -276,7 +276,7 @@ fn opts() -> clap::App<'static, 'static> {
             clap::Arg::with_name("output")
                 .short("o")
                 .long("output")
-                .value_name("<dir>")
+                .value_name("dir")
                 .help("Where to build output.")
                 .takes_value(true),
         )
@@ -293,7 +293,7 @@ fn opts() -> clap::App<'static, 'static> {
         .arg(
             clap::Arg::with_name("oiv-manifest")
                 .long("oiv-manifest")
-                .value_name("<file>")
+                .value_name("file")
                 .help("Where to write the GTAV .oiv manifest.")
                 .takes_value(true),
         )
@@ -349,8 +349,13 @@ fn process_single(
 
     for replace in replaces {
         let range = &replace.range;
-        let start = pos(range.start.as_ref(), s, duration) as usize;
-        let end = pos(range.end.as_ref(), s, duration) as usize;
+        let start = pos(range.start.as_ref(), s, duration, 0) as usize;
+        let end = pos(range.end.as_ref(), s, duration, duration) as usize;
+
+        if start == end {
+            continue;
+        }
+
         let generated = generator.generate(start..end, s.sample_rate);
         (&mut data[start..end]).copy_from_slice(&generated);
     }
@@ -367,7 +372,7 @@ fn process_single(
     writer.flush()?;
     return Ok(());
 
-    fn pos(pos: Option<&Pos>, s: hound::WavSpec, duration: u32) -> u32 {
+    fn pos(pos: Option<&Pos>, s: hound::WavSpec, duration: u32, default: u32) -> u32 {
         match pos.as_ref() {
             Some(pos) => {
                 let pos = pos
@@ -378,7 +383,7 @@ fn process_single(
 
                 u32::min(pos, duration)
             }
-            None => 0,
+            None => default,
         }
     }
 }
