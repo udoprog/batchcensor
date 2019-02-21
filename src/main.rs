@@ -1,7 +1,7 @@
 use failure::ResultExt;
 use relative_path::RelativePathBuf;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::File,
     path::{Path, PathBuf},
@@ -518,8 +518,9 @@ fn main() -> Result<(), failure::Error> {
     // keep track if we are processing any files, which will determine what goes into the manifest.
     let mut modified = BTreeSet::new();
 
-    let mut roots = Vec::new();
     let mut index = BTreeMap::new();
+    let mut roots = HashMap::new();
+    let mut dirs = HashMap::<PathBuf, Vec<_>>::new();
 
     // Go through all configurations and construct root directories.
     for (root, config_path, config) in &configs {
@@ -535,20 +536,23 @@ fn main() -> Result<(), failure::Error> {
                 failure::bail!("no such directory: {}", root.display());
             }
 
+            dirs.entry(root.clone()).or_default().push(dir);
+
             let mut dest_root = output.to_owned();
 
             for c in dir.path.components() {
                 dest_root.push(c.as_str());
             }
 
-            roots.push((dir, root, dest_root, config_path, config));
+            roots.insert(root, (dest_root, *config_path, config, &dir.path));
         }
     }
 
-    // Go through all configurations and find all files to be processed.
-    let mut dirs = Vec::with_capacity(roots.len());
+    for (root, (dest_root, config_path, config, dir_path)) in &roots {
+        if !root.is_dir() {
+            failure::bail!("no such directory: {}", root.display());
+        }
 
-    for (dir, root, dest_root, config_path, config) in &roots {
         for result in ignore::Walk::new(&root) {
             let result = result?;
             let path = result.path().to_owned();
@@ -567,73 +571,71 @@ fn main() -> Result<(), failure::Error> {
                 }
             }
 
-            index.insert(path, (config_path, dest_root, &dir.path));
+            index.insert(path, (config_path, dest_root, *dir_path));
         }
 
-        dirs.push((dir, root, dest_root, config));
-    }
+        // Process all dirs.
+        for dir in dirs.get(root).into_iter().flat_map(|r| r) {
+            // copy corresponding .oac file if present.
+            {
+                let oac = root.with_extension("oac");
 
-    // Process all dirs.
-    for (dir, root, dest_root, config) in dirs {
-        // copy corresponding .oac file if present.
-        {
-            let oac = root.with_extension("oac");
-
-            if oac.is_file() {
-                tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
-            }
-        }
-
-        for f in &dir.files {
-            let file_extension = dir
-                .file_extension
-                .as_ref()
-                .or(config.file_extension.as_ref());
-
-            // temp storage for modified path.
-            let mut replaced;
-            let mut path = &f.path;
-
-            if let Some(file_prefix) = dir.file_prefix.as_ref() {
-                let name = match path.file_name() {
-                    Some(existing) => format!("{}{}", file_prefix, existing),
-                    None => file_prefix.to_string(),
-                };
-
-                let new_path = path.with_file_name(name);
-                replaced = None;
-                path = replaced.get_or_insert(new_path);
+                if oac.is_file() {
+                    tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
+                }
             }
 
-            if let Some(file_extension) = file_extension {
-                let new_path = path.with_extension(file_extension);
-                replaced = None;
-                path = replaced.get_or_insert(new_path);
-            }
+            for f in &dir.files {
+                let file_extension = dir
+                    .file_extension
+                    .as_ref()
+                    .or(config.file_extension.as_ref());
 
-            let path = path.to_path(&root);
+                // temp storage for modified path.
+                let mut replaced;
+                let mut path = &f.path;
 
-            if index.remove(&path).is_none() {
-                failure::bail!("did not expect to censor file: {}", path.display());
-            }
+                if let Some(file_prefix) = dir.file_prefix.as_ref() {
+                    let name = match path.file_name() {
+                        Some(existing) => format!("{}{}", file_prefix, existing),
+                        None => file_prefix.to_string(),
+                    };
 
-            let dest = dest_root.join(
-                path.file_name()
-                    .ok_or_else(|| failure::format_err!("expected file name"))?,
-            );
+                    let new_path = path.with_file_name(name);
+                    replaced = None;
+                    path = replaced.get_or_insert(new_path);
+                }
 
-            // audio file already clean.
-            if f.replace.is_empty() {
-                tasks.push(Task::Copy(path, dest));
-                continue;
-            }
+                if let Some(file_extension) = file_extension {
+                    let new_path = path.with_extension(file_extension);
+                    replaced = None;
+                    path = replaced.get_or_insert(new_path);
+                }
 
-            modified.insert(dir.path.to_owned());
-            tasks.push(Task::Process(path, dest, &f.replace));
+                let path = path.to_path(&root);
 
-            if stats {
-                for r in &f.replace {
-                    *counts.entry(r.kind.clone()).or_default() += 1;
+                if index.remove(&path).is_none() {
+                    failure::bail!("did not expect to censor file: {}", path.display());
+                }
+
+                let dest = dest_root.join(
+                    path.file_name()
+                        .ok_or_else(|| failure::format_err!("expected file name"))?,
+                );
+
+                // audio file already clean.
+                if f.replace.is_empty() {
+                    tasks.push(Task::Copy(path, dest));
+                    continue;
+                }
+
+                modified.insert(dir.path.to_owned());
+                tasks.push(Task::Process(path, dest, &f.replace));
+
+                if stats {
+                    for r in &f.replace {
+                        *counts.entry(r.kind.clone()).or_default() += 1;
+                    }
                 }
             }
         }
