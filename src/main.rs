@@ -1,68 +1,21 @@
+use batchcensor::{generator, Generator, Pos, Replace, Transcript};
 use failure::ResultExt;
 use relative_path::RelativePathBuf;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::File,
-    ops,
     path::{Path, PathBuf},
 };
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
-
-/// Noise generator
-pub trait Generator: Sync + Send {
-    fn generate(&self, range: ops::Range<usize>, sample_rate: u32) -> Vec<i16>;
-}
-
-struct Zero;
-
-impl Generator for Zero {
-    fn generate(&self, range: ops::Range<usize>, _: u32) -> Vec<i16> {
-        range.map(|_| i16::default()).collect::<Vec<_>>()
-    }
-}
-
-struct Tone {
-    /// Frequency of the tone.
-    frequency: f32,
-    /// Amplitude from 0..1
-    amplitude: f32,
-}
-
-impl Tone {
-    /// Construct a new default tone generator.
-    pub fn new() -> Self {
-        Self {
-            frequency: 1000f32,
-            amplitude: 0.3f32,
-        }
-    }
-}
-
-impl Generator for Tone {
-    fn generate(&self, range: ops::Range<usize>, sample_rate: u32) -> Vec<i16> {
-        use std::f32::consts::PI;
-
-        let sample_rate = sample_rate as f32;
-
-        range
-            .into_iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let mag = (i as f32) * self.frequency * 2f32 * PI / sample_rate;
-                (mag.sin() * self.amplitude * (std::i16::MAX as f32)) as i16
-            })
-            .collect()
-    }
-}
 
 /// A single task that can be executed.
 pub enum Task<'a> {
     /// Copy a single file.
     Copy(PathBuf, PathBuf),
     /// Regular processing with replacements.
-    Process(PathBuf, PathBuf, &'a [Replace]),
+    Process(PathBuf, PathBuf, Vec<&'a Replace>),
     // Silent processing.
     ProcessSilent(PathBuf, PathBuf),
 }
@@ -73,7 +26,7 @@ impl<'a> Task<'a> {
             Task::Copy(ref path, ref dest) => {
                 process_copy(path, dest)?;
             }
-            Task::Process(ref path, ref dest, replace) => {
+            Task::Process(ref path, ref dest, ref replace) => {
                 process_single(&path, &dest, replace, generator)?;
             }
             Task::ProcessSilent(ref path, ref dest) => {
@@ -104,16 +57,10 @@ impl<'a> fmt::Display for Task<'a> {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct Replace {
-    kind: String,
-    range: Range,
-}
-
-#[derive(Debug, serde::Deserialize)]
 pub struct ReplaceFile {
     path: RelativePathBuf,
     /// Transcript of the recording.
-    transcript: Option<String>,
+    transcript: Option<Transcript>,
     /// Replacements. If empty, file is clean.
     #[serde(default)]
     replace: Vec<Replace>,
@@ -136,109 +83,6 @@ pub struct Config {
     file_extension: Option<String>,
     #[serde(default)]
     dirs: Vec<ReplaceDir>,
-}
-
-#[derive(Debug)]
-pub struct Pos {
-    hours: u32,
-    minutes: u32,
-    seconds: u32,
-    milliseconds: u32,
-}
-
-impl Pos {
-    /// Convert into samples given a sample rate.
-    pub fn as_samples(&self, sample_rate: u32) -> Option<u32> {
-        let samples = 0u32
-            .checked_add(self.hours.checked_mul(3600)?.checked_mul(sample_rate)?)?
-            .checked_add(self.minutes.checked_mul(60)?.checked_mul(sample_rate)?)?
-            .checked_add(self.seconds.checked_mul(sample_rate)?)?
-            .checked_add(
-                self.milliseconds
-                    .checked_mul(sample_rate.checked_div(1000)?)?,
-            )?;
-
-        Some(samples)
-    }
-}
-
-impl Pos {
-    /// Deserialize stringa as a position.
-    pub fn parse(s: &str) -> Option<Pos> {
-        let mut main = s.split(':');
-        let last = main.next_back()?;
-        let mut last = last.split(".");
-        let seconds = str::parse::<u32>(last.next()?).ok()?;
-        let milliseconds = str::parse::<u32>(last.next()?).ok()?;
-
-        let minutes = last
-            .next()
-            .and_then(|s| str::parse::<u32>(s).ok())
-            .unwrap_or_default();
-
-        let hours = last
-            .next()
-            .and_then(|s| str::parse::<u32>(s).ok())
-            .unwrap_or_default();
-
-        Some(Pos {
-            hours,
-            minutes,
-            seconds,
-            milliseconds,
-        })
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Pos {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Pos::parse(&s).ok_or_else(|| <D::Error as serde::de::Error>::custom("bad position"))
-    }
-}
-
-#[derive(Debug)]
-pub struct Range {
-    pub start: Option<Pos>,
-    pub end: Option<Pos>,
-}
-
-impl Range {
-    /// Deserialize stringa as a position.
-    pub fn parse(s: &str) -> Option<Range> {
-        let mut main = s.split('-');
-        let start = pos(main.next(), "^")?;
-        let end = pos(main.next(), "$")?;
-
-        return Some(Range { start, end });
-
-        fn pos(pos: Option<&str>, term: &str) -> Option<Option<Pos>> {
-            let pos = match pos {
-                Some(pos) => pos,
-                None => return None,
-            };
-
-            if pos == term {
-                return Some(None);
-            }
-
-            let pos = Pos::parse(pos)?;
-            Some(Some(pos))
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Range {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s: String = String::deserialize(deserializer)?;
-        Range::parse(&s).ok_or_else(|| <D::Error as serde::de::Error>::custom("bad position"))
-    }
 }
 
 /// CLI options.
@@ -322,7 +166,7 @@ fn process_copy(path: &Path, dest: &Path) -> Result<(), failure::Error> {
 fn process_single(
     path: &Path,
     dest_path: &Path,
-    replaces: &[Replace],
+    replaces: &[&Replace],
     generator: &dyn Generator,
 ) -> Result<(), failure::Error> {
     let dest_parent = dest_path
@@ -711,14 +555,21 @@ fn main() -> Result<(), failure::Error> {
                         .ok_or_else(|| failure::format_err!("expected file name"))?,
                 );
 
+                let mut replace = Vec::new();
+                replace.extend(&f.replace);
+
+                if let Some(transcript) = f.transcript.as_ref() {
+                    replace.extend(&transcript.replace);
+                }
+
                 // audio file already clean.
-                if f.replace.is_empty() {
+                if replace.is_empty() {
                     tasks.push(Task::Copy(path, dest));
                     continue;
                 }
 
                 modified.insert(dir.path.to_owned());
-                tasks.push(Task::Process(path, dest, &f.replace));
+                tasks.push(Task::Process(path, dest, replace));
 
                 if stats {
                     for r in &f.replace {
@@ -767,9 +618,9 @@ fn main() -> Result<(), failure::Error> {
         let pb = indicatif::ProgressBar::new(tasks.len() as u64);
 
         let generator = if tone {
-            Box::new(Tone::new()) as Box<dyn Generator>
+            Box::new(generator::Tone::new()) as Box<dyn Generator>
         } else {
-            Box::new(Zero) as Box<dyn Generator>
+            Box::new(generator::Silence::new()) as Box<dyn Generator>
         };
 
         tasks
