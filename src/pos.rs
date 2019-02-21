@@ -1,9 +1,9 @@
 #[derive(Debug, PartialEq, Eq)]
 pub struct Pos {
-    hours: u32,
-    minutes: u32,
-    seconds: u32,
-    milliseconds: u32,
+    pub hours: u32,
+    pub minutes: u32,
+    pub seconds: u32,
+    pub milliseconds: u32,
 }
 
 impl Pos {
@@ -26,16 +26,21 @@ impl Pos {
         let mut main = s.split(':');
         let last = main.next_back()?;
         let mut last = last.split(".");
-        let seconds = str::parse::<u32>(last.next()?).ok()?;
+
+        let seconds = match last.next()?.trim() {
+            "" => 0,
+            seconds => str::parse::<u32>(seconds).ok()?,
+        };
+
         let milliseconds = str::parse::<u32>(last.next()?).ok()?;
 
-        let minutes = last
-            .next()
+        let minutes = main
+            .next_back()
             .and_then(|s| str::parse::<u32>(s).ok())
             .unwrap_or_default();
 
-        let hours = last
-            .next()
+        let hours = main
+            .next_back()
             .and_then(|s| str::parse::<u32>(s).ok())
             .unwrap_or_default();
 
@@ -55,5 +60,53 @@ impl<'de> serde::Deserialize<'de> for Pos {
     {
         let s: String = String::deserialize(deserializer)?;
         Pos::parse(&s).ok_or_else(|| <D::Error as serde::de::Error>::custom("bad position"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pos;
+
+    #[test]
+    pub fn test() {
+        assert_eq!(
+            Pos {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                milliseconds: 123,
+            },
+            Pos::parse(".123").expect("bad position")
+        );
+
+        assert_eq!(
+            Pos {
+                hours: 0,
+                minutes: 0,
+                seconds: 42,
+                milliseconds: 123,
+            },
+            Pos::parse("42.123").expect("bad position")
+        );
+
+        assert_eq!(
+            Pos {
+                hours: 0,
+                minutes: 21,
+                seconds: 42,
+                milliseconds: 123,
+            },
+            Pos::parse("21:42.123").expect("bad position")
+        );
+
+        assert_eq!(
+            Pos {
+                hours: 12,
+                minutes: 21,
+                seconds: 42,
+                milliseconds: 123,
+            },
+            Pos::parse("12:21:42.123").expect("bad position")
+        );
     }
 }

@@ -568,14 +568,14 @@ fn main() -> Result<(), failure::Error> {
                     continue;
                 }
 
-                modified.insert(dir.path.to_owned());
-                tasks.push(Task::Process(path, dest, replace));
-
                 if stats {
-                    for r in &f.replace {
-                        *counts.entry(r.kind.clone()).or_default() += 1;
+                    for r in replace.iter().cloned() {
+                        *counts.entry(r.kind.to_lowercase()).or_default() += 1;
                     }
                 }
+
+                modified.insert(dir.path.to_owned());
+                tasks.push(Task::Process(path, dest, replace));
             }
         }
     }
