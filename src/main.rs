@@ -100,13 +100,17 @@ pub struct Pos {
 
 impl Pos {
     /// Convert into samples given a sample rate.
-    pub fn as_samples(&self, sample_rate: u32) -> u32 {
-        let mut samples = 0u32;
-        samples += self.hours * 3600 * sample_rate;
-        samples += self.minutes * 60 * sample_rate;
-        samples += self.seconds * sample_rate;
-        samples += self.milliseconds * (sample_rate / 1000);
-        samples
+    pub fn as_samples(&self, sample_rate: u32) -> Option<u32> {
+        let samples = 0u32
+            .checked_add(self.hours.checked_mul(3600)?.checked_mul(sample_rate)?)?
+            .checked_add(self.minutes.checked_mul(60)?.checked_mul(sample_rate)?)?
+            .checked_add(self.seconds.checked_mul(sample_rate)?)?
+            .checked_add(
+                self.milliseconds
+                    .checked_mul(sample_rate.checked_div(1000)?)?,
+            )?;
+
+        Some(samples)
     }
 }
 
@@ -150,18 +154,32 @@ impl<'de> serde::Deserialize<'de> for Pos {
 
 #[derive(Debug)]
 pub struct Range {
-    pub start: Pos,
-    pub end: Pos,
+    pub start: Option<Pos>,
+    pub end: Option<Pos>,
 }
 
 impl Range {
     /// Deserialize stringa as a position.
     pub fn parse(s: &str) -> Option<Range> {
         let mut main = s.split('-');
-        let start = main.next().and_then(Pos::parse)?;
-        let end = main.next().and_then(Pos::parse)?;
+        let start = pos(main.next())?;
+        let end = pos(main.next())?;
 
-        Some(Range { start, end })
+        return Some(Range { start, end });
+
+        fn pos(pos: Option<&str>) -> Option<Option<Pos>> {
+            let pos = match pos {
+                Some(pos) => pos,
+                None => return None,
+            };
+
+            if pos == "" {
+                return Some(None);
+            }
+
+            let pos = Pos::parse(pos)?;
+            Some(Some(pos))
+        }
     }
 }
 
@@ -277,13 +295,8 @@ fn process_single(
 
     for replace in replaces {
         let range = &replace.range;
-        let mut start = range.start.as_samples(s.sample_rate) as usize;
-        start *= s.channels as usize;
-
-        let mut end = range.end.as_samples(s.sample_rate) as usize;
-        end *= s.channels as usize;
-        end = usize::min(end, duration as usize);
-
+        let start = pos(range.start.as_ref(), s, duration) as usize;
+        let end = pos(range.end.as_ref(), s, duration) as usize;
         let zeros = (start..end).map(|_| i16::default()).collect::<Vec<_>>();
         (&mut data[start..end]).copy_from_slice(&zeros);
     }
@@ -298,7 +311,22 @@ fn process_single(
     }
 
     writer.flush()?;
-    Ok(())
+    return Ok(());
+
+    fn pos(pos: Option<&Pos>, s: hound::WavSpec, duration: u32) -> u32 {
+        match pos.as_ref() {
+            Some(pos) => {
+                let pos = pos
+                    .as_samples(s.sample_rate)
+                    .expect("samples overflow with sample rate")
+                    .checked_mul(s.channels as u32)
+                    .expect("overflow");
+
+                u32::min(pos, duration)
+            }
+            None => 0,
+        }
+    }
 }
 
 /// Replace the given file with silence.
