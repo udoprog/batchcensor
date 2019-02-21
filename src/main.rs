@@ -460,6 +460,7 @@ fn main() -> Result<(), failure::Error> {
     let m = opts().get_matches();
     let list = m.is_present("list");
     let stats = m.is_present("stats");
+    let output = m.value_of("output").map(PathBuf::from);
 
     let mut counts = BTreeMap::<String, u64>::new();
 
@@ -517,11 +518,15 @@ fn main() -> Result<(), failure::Error> {
     // keep track if we are processing any files, which will determine what goes into the manifest.
     let mut modified = BTreeSet::new();
 
+    let mut roots = Vec::new();
+    let mut index = BTreeMap::new();
+
+    // Go through all configurations and construct root directories.
     for (root, config_path, config) in &configs {
-        let output = match m.value_of("output") {
-            Some(output) => PathBuf::from(output),
-            None => root.join("output"),
-        };
+        let output = output
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| root.join("output"));
 
         for dir in &config.dirs {
             let root = dir.path.to_path(&root);
@@ -536,120 +541,129 @@ fn main() -> Result<(), failure::Error> {
                 dest_root.push(c.as_str());
             }
 
-            // copy corresponding .oac file if present.
-            {
-                let oac = root.with_extension("oac");
+            roots.push((dir, root, dest_root, config_path, config));
+        }
+    }
 
-                if oac.is_file() {
-                    tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
-                }
+    // Go through all configurations and find all files to be processed.
+    let mut dirs = Vec::with_capacity(roots.len());
+
+    for (dir, root, dest_root, config_path, config) in &roots {
+        for result in ignore::Walk::new(&root) {
+            let result = result?;
+            let path = result.path().to_owned();
+
+            if !path.is_file() {
+                continue;
             }
 
-            let mut index = BTreeMap::new();
-
-            for result in ignore::Walk::new(&root) {
-                let result = result?;
-                let path = result.path().to_owned();
-
-                if !path.is_file() {
-                    continue;
-                }
-
-                match path.extension().and_then(|s| s.to_str()) {
-                    Some("wav") => {}
-                    _ => {
-                        let dest = dest_root.join(path.strip_prefix(&root)?);
-                        // NB: straight up copy other files.
-                        tasks.push(Task::Copy(path, dest));
-                        continue;
-                    }
-                }
-
-                index.insert(path, &dir.path);
-            }
-
-            for f in &dir.files {
-                let file_extension = dir
-                    .file_extension
-                    .as_ref()
-                    .or(config.file_extension.as_ref());
-
-                // temp storage for modified path.
-                let mut replaced;
-                let mut path = &f.path;
-
-                if let Some(file_prefix) = dir.file_prefix.as_ref() {
-                    let name = match path.file_name() {
-                        Some(existing) => format!("{}{}", file_prefix, existing),
-                        None => file_prefix.to_string(),
-                    };
-
-                    let new_path = path.with_file_name(name);
-                    replaced = None;
-                    path = replaced.get_or_insert(new_path);
-                }
-
-                if let Some(file_extension) = file_extension {
-                    let new_path = path.with_extension(file_extension);
-                    replaced = None;
-                    path = replaced.get_or_insert(new_path);
-                }
-
-                let path = path.to_path(&root);
-
-                if index.remove(&path).is_none() {
-                    failure::bail!("did not expect to censor file: {}", path.display());
-                }
-
-                let dest = dest_root.join(
-                    path.file_name()
-                        .ok_or_else(|| failure::format_err!("expected file name"))?,
-                );
-
-                // audio file already clean.
-                if f.replace.is_empty() {
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("wav") => {}
+                _ => {
+                    let dest = dest_root.join(path.strip_prefix(&root)?);
+                    // NB: straight up copy other files.
                     tasks.push(Task::Copy(path, dest));
                     continue;
                 }
-
-                modified.insert(dir.path.to_owned());
-                tasks.push(Task::Process(path, dest, &f.replace));
-
-                if stats {
-                    for r in &f.replace {
-                        *counts.entry(r.kind.clone()).or_default() += 1;
-                    }
-                }
             }
 
-            if !index.is_empty() {
-                if !list {
-                    eprintln!(
-                        "{}: missing censor configuration for {} file(s) (--list to see them)",
-                        config_path.display(),
-                        index.len()
-                    );
-                }
+            index.insert(path, (config_path, dest_root, &dir.path));
+        }
 
-                for (path, file) in index {
-                    if list {
-                        eprintln!(
-                            "{}: missing config for: {}",
-                            config_path.display(),
-                            path.display()
-                        );
-                    }
+        dirs.push((dir, root, dest_root, config));
+    }
 
-                    let dest = dest_root.join(
-                        path.file_name()
-                            .and_then(|n| n.to_str())
-                            .ok_or_else(|| failure::format_err!("expected file name"))?,
-                    );
+    // Process all dirs.
+    for (dir, root, dest_root, config) in dirs {
+        // copy corresponding .oac file if present.
+        {
+            let oac = root.with_extension("oac");
 
-                    modified.insert(file.to_owned());
-                    tasks.push(Task::ProcessSilent(path, dest));
+            if oac.is_file() {
+                tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
+            }
+        }
+
+        for f in &dir.files {
+            let file_extension = dir
+                .file_extension
+                .as_ref()
+                .or(config.file_extension.as_ref());
+
+            // temp storage for modified path.
+            let mut replaced;
+            let mut path = &f.path;
+
+            if let Some(file_prefix) = dir.file_prefix.as_ref() {
+                let name = match path.file_name() {
+                    Some(existing) => format!("{}{}", file_prefix, existing),
+                    None => file_prefix.to_string(),
+                };
+
+                let new_path = path.with_file_name(name);
+                replaced = None;
+                path = replaced.get_or_insert(new_path);
+            }
+
+            if let Some(file_extension) = file_extension {
+                let new_path = path.with_extension(file_extension);
+                replaced = None;
+                path = replaced.get_or_insert(new_path);
+            }
+
+            let path = path.to_path(&root);
+
+            if index.remove(&path).is_none() {
+                failure::bail!("did not expect to censor file: {}", path.display());
+            }
+
+            let dest = dest_root.join(
+                path.file_name()
+                    .ok_or_else(|| failure::format_err!("expected file name"))?,
+            );
+
+            // audio file already clean.
+            if f.replace.is_empty() {
+                tasks.push(Task::Copy(path, dest));
+                continue;
+            }
+
+            modified.insert(dir.path.to_owned());
+            tasks.push(Task::Process(path, dest, &f.replace));
+
+            if stats {
+                for r in &f.replace {
+                    *counts.entry(r.kind.clone()).or_default() += 1;
                 }
             }
+        }
+    }
+
+    if !index.is_empty() {
+        if !list {
+            eprintln!(
+                "missing censor configuration for {} file(s) (--list to see them)",
+                index.len()
+            );
+        }
+
+        for (path, (config_path, dest_root, file)) in index {
+            if list {
+                eprintln!(
+                    "{}: missing config for: {}",
+                    config_path.display(),
+                    path.display()
+                );
+            }
+
+            let dest = dest_root.join(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| failure::format_err!("expected file name"))?,
+            );
+
+            modified.insert(file.to_owned());
+            tasks.push(Task::ProcessSilent(path, dest));
         }
     }
 
