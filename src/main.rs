@@ -4,10 +4,58 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::File,
+    ops,
     path::{Path, PathBuf},
 };
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+/// Noise generator
+pub trait Generator: Sync + Send {
+    fn generate(&self, range: ops::Range<usize>, sample_rate: u32) -> Vec<i16>;
+}
+
+struct Zero;
+
+impl Generator for Zero {
+    fn generate(&self, range: ops::Range<usize>, _: u32) -> Vec<i16> {
+        range.map(|_| i16::default()).collect::<Vec<_>>()
+    }
+}
+
+struct Tone {
+    /// Frequency of the tone.
+    frequency: f32,
+    /// Amplitude from 0..1
+    amplitude: f32,
+}
+
+impl Tone {
+    /// Construct a new default tone generator.
+    pub fn new() -> Self {
+        Self {
+            frequency: 1000f32,
+            amplitude: 0.3f32,
+        }
+    }
+}
+
+impl Generator for Tone {
+    fn generate(&self, range: ops::Range<usize>, sample_rate: u32) -> Vec<i16> {
+        use std::f32::consts::PI;
+
+        let sample_rate = sample_rate as f32;
+
+        range
+            .into_iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let mag = (i as f32) * self.frequency * 2f32 * PI / sample_rate;
+                (mag.sin() * self.amplitude * (std::i16::MAX as f32)) as i16
+            })
+            .collect()
+    }
+}
 
 /// A single task that can be executed.
 pub enum Task<'a> {
@@ -20,13 +68,13 @@ pub enum Task<'a> {
 }
 
 impl<'a> Task<'a> {
-    fn run(&self) -> Result<(), failure::Error> {
+    fn run(&self, generator: &dyn Generator) -> Result<(), failure::Error> {
         match *self {
             Task::Copy(ref path, ref dest) => {
                 process_copy(path, dest)?;
             }
             Task::Process(ref path, ref dest, replace) => {
-                process_single(&path, &dest, replace)?;
+                process_single(&path, &dest, replace, generator)?;
             }
             Task::ProcessSilent(ref path, ref dest) => {
                 process_silent(&path, &dest)?;
@@ -249,6 +297,11 @@ fn opts() -> clap::App<'static, 'static> {
                 .help("Where to write the GTAV .oiv manifest.")
                 .takes_value(true),
         )
+        .arg(
+            clap::Arg::with_name("tone")
+                .long("tone")
+                .help("Replace censored sections with a 1000Hz tone instead of blank audio."),
+        )
 }
 
 /// Copy a single file.
@@ -270,6 +323,7 @@ fn process_single(
     path: &Path,
     dest_path: &Path,
     replaces: &[Replace],
+    generator: &dyn Generator,
 ) -> Result<(), failure::Error> {
     let dest_parent = dest_path
         .parent()
@@ -297,8 +351,8 @@ fn process_single(
         let range = &replace.range;
         let start = pos(range.start.as_ref(), s, duration) as usize;
         let end = pos(range.end.as_ref(), s, duration) as usize;
-        let zeros = (start..end).map(|_| i16::default()).collect::<Vec<_>>();
-        (&mut data[start..end]).copy_from_slice(&zeros);
+        let generated = generator.generate(start..end, s.sample_rate);
+        (&mut data[start..end]).copy_from_slice(&generated);
     }
 
     let d = File::create(&dest_path)?;
@@ -488,6 +542,7 @@ fn main() -> Result<(), failure::Error> {
     let m = opts().get_matches();
     let list = m.is_present("list");
     let stats = m.is_present("stats");
+    let tone = m.is_present("tone");
     let output = m.value_of("output").map(PathBuf::from);
 
     let mut counts = BTreeMap::<String, u64>::new();
@@ -581,6 +636,15 @@ fn main() -> Result<(), failure::Error> {
             failure::bail!("no such directory: {}", root.display());
         }
 
+        // copy corresponding .oac file if present.
+        {
+            let oac = root.with_extension("oac");
+
+            if oac.is_file() {
+                tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
+            }
+        }
+
         for result in ignore::Walk::new(&root) {
             let result = result?;
             let path = result.path().to_owned();
@@ -604,15 +668,6 @@ fn main() -> Result<(), failure::Error> {
 
         // Process all dirs.
         for dir in dirs.get(root).into_iter().flat_map(|r| r) {
-            // copy corresponding .oac file if present.
-            {
-                let oac = root.with_extension("oac");
-
-                if oac.is_file() {
-                    tasks.push(Task::Copy(oac, dest_root.with_extension("oac")));
-                }
-            }
-
             for f in &dir.files {
                 let file_extension = dir
                     .file_extension
@@ -706,11 +761,17 @@ fn main() -> Result<(), failure::Error> {
     } else {
         let pb = indicatif::ProgressBar::new(tasks.len() as u64);
 
+        let generator = if tone {
+            Box::new(Tone::new()) as Box<dyn Generator>
+        } else {
+            Box::new(Zero) as Box<dyn Generator>
+        };
+
         tasks
             .into_par_iter()
             .map(|t| {
                 let r = t
-                    .run()
+                    .run(&*generator)
                     .with_context(|_| failure::format_err!("failed to run: {}", t));
                 pb.inc(1);
                 r
