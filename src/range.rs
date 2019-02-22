@@ -1,6 +1,7 @@
 use crate::Pos;
+use std::fmt;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Range {
     pub start: Option<Pos>,
     pub end: Option<Pos>,
@@ -28,6 +29,24 @@ impl Range {
             let pos = Pos::parse(pos)?;
             Some(Some(pos))
         }
+    }
+}
+
+impl fmt::Display for Range {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.start {
+            Some(ref start) => start.fmt(fmt)?,
+            None => "^".fmt(fmt)?,
+        }
+
+        write!(fmt, "-")?;
+
+        match self.end {
+            Some(ref end) => end.fmt(fmt)?,
+            None => "^".fmt(fmt)?,
+        }
+
+        Ok(())
     }
 }
 

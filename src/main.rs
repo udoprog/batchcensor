@@ -1,7 +1,8 @@
-use batchcensor::{generator, Generator, Pos, Replace, Transcript};
+use batchcensor::{generator, utils, Config, Generator, Pos, Replace};
 use failure::ResultExt;
 use relative_path::RelativePathBuf;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::File,
@@ -17,7 +18,7 @@ pub enum Task<'a> {
     /// Regular processing with replacements.
     Process(PathBuf, PathBuf, Vec<&'a Replace>),
     // Silent processing.
-    ProcessSilent(PathBuf, PathBuf),
+    Silence(PathBuf, PathBuf),
 }
 
 impl<'a> Task<'a> {
@@ -29,7 +30,7 @@ impl<'a> Task<'a> {
             Task::Process(ref path, ref dest, ref replace) => {
                 process_single(&path, &dest, replace, generator)?;
             }
-            Task::ProcessSilent(ref path, ref dest) => {
+            Task::Silence(ref path, ref dest) => {
                 process_silent(&path, &dest)?;
             }
         }
@@ -47,42 +48,13 @@ impl<'a> fmt::Display for Task<'a> {
             Task::Process(ref path, ref dest, ..) => {
                 write!(fmt, "process {} -> {}", path.display(), dest.display())?;
             }
-            Task::ProcessSilent(ref path, ref dest) => {
+            Task::Silence(ref path, ref dest) => {
                 write!(fmt, "silence {} -> {}", path.display(), dest.display())?;
             }
         }
 
         Ok(())
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ReplaceFile {
-    path: RelativePathBuf,
-    /// Transcript of the recording.
-    transcript: Option<Transcript>,
-    /// Replacements. If empty, file is clean.
-    #[serde(default)]
-    replace: Vec<Replace>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ReplaceDir {
-    path: RelativePathBuf,
-    #[serde(default)]
-    file_prefix: Option<String>,
-    #[serde(default)]
-    file_extension: Option<String>,
-    #[serde(default)]
-    files: Vec<ReplaceFile>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct Config {
-    #[serde(default)]
-    file_extension: Option<String>,
-    #[serde(default)]
-    dirs: Vec<ReplaceDir>,
 }
 
 /// CLI options.
@@ -201,6 +173,21 @@ fn process_single(
         }
 
         let generated = generator.generate(start..end, s.sample_rate);
+
+        if start >= end {
+            failure::bail!("{}: {} (start) is not before {} (end)", replace, start, end);
+        }
+
+        if start > data.len() || end > data.len() {
+            failure::bail!(
+                "{}: {}-{} out of range 0-{}",
+                replace,
+                start,
+                end,
+                data.len()
+            );
+        }
+
         (&mut data[start..end]).copy_from_slice(&generated);
     }
 
@@ -450,7 +437,8 @@ fn main() -> Result<(), failure::Error> {
     // keep track if we are processing any files, which will determine what goes into the manifest.
     let mut modified = BTreeSet::new();
 
-    let mut index = BTreeMap::new();
+    let mut missing = BTreeMap::new();
+    let mut silenced = BTreeMap::new();
     let mut roots = HashMap::new();
     let mut dirs = HashMap::<PathBuf, Vec<_>>::new();
 
@@ -512,54 +500,53 @@ fn main() -> Result<(), failure::Error> {
                 }
             }
 
-            index.insert(path, (config_path, dest_root, *dir_path));
+            // Keep track of all files to produce a list of files missing configuration in the end.
+            missing.insert(path, (config_path, dest_root, *dir_path));
         }
 
         // Process all dirs.
         for dir in dirs.get(root).into_iter().flat_map(|r| r) {
-            for f in &dir.files {
+            for (i, (path, mut replace, transcript)) in dir.files.iter().enumerate() {
                 let file_extension = dir
                     .file_extension
                     .as_ref()
                     .or(config.file_extension.as_ref());
 
-                // temp storage for modified path.
-                let mut replaced;
-                let mut path = &f.path;
+                // temp storage for modified path so that we can continue dealing with references.
+                let mut path = Cow::Borrowed(path);
 
-                if let Some(file_prefix) = dir.file_prefix.as_ref() {
-                    let name = match path.file_name() {
-                        Some(existing) => format!("{}{}", file_prefix, existing),
-                        None => file_prefix.to_string(),
-                    };
-
-                    let new_path = path.with_file_name(name);
-                    replaced = None;
-                    path = replaced.get_or_insert(new_path);
-                }
+                // replace a `$$` in any component present with the current enumeration.
+                path = utils::path_enumeration(i, path);
+                path = utils::path_file_prefix(dir.prefix.as_ref().map(|s| s.as_str()), path);
+                path = utils::path_file_suffix(dir.suffix.as_ref().map(|s| s.as_str()), path);
 
                 if let Some(file_extension) = file_extension {
-                    let new_path = path.with_extension(file_extension);
-                    replaced = None;
-                    path = replaced.get_or_insert(new_path);
+                    path = Cow::Owned(path.with_extension(file_extension));
                 }
 
                 let path = path.to_path(&root);
-
-                if index.remove(&path).is_none() {
-                    failure::bail!("did not expect to censor file: {}", path.display());
-                }
 
                 let dest = dest_root.join(
                     path.file_name()
                         .ok_or_else(|| failure::format_err!("expected file name"))?,
                 );
 
-                let mut replace = Vec::new();
-                replace.extend(&f.replace);
+                let indexed = match missing.remove(&path) {
+                    Some(indexed) => indexed,
+                    None => {
+                        failure::bail!("did not expect to censor file: {}", path.display());
+                    }
+                };
 
-                if let Some(transcript) = f.transcript.as_ref() {
-                    replace.extend(&transcript.replace);
+                if let Some(transcript) = transcript {
+                    // file silenced because it has marked words which do not have a range.
+                    if !transcript.missing.is_empty() {
+                        silenced.insert(path.clone(), indexed);
+                        tasks.push(Task::Silence(path, dest));
+                        continue;
+                    }
+
+                    replace.extend(transcript.replace.iter());
                 }
 
                 // audio file already clean.
@@ -570,7 +557,7 @@ fn main() -> Result<(), failure::Error> {
 
                 if stats {
                     for r in replace.iter().cloned() {
-                        *counts.entry(r.kind.to_lowercase()).or_default() += 1;
+                        *counts.entry(r.word.to_lowercase()).or_default() += 1;
                     }
                 }
 
@@ -580,16 +567,23 @@ fn main() -> Result<(), failure::Error> {
         }
     }
 
-    if !index.is_empty() {
+    if !missing.is_empty() || !silenced.is_empty() {
         if !list {
-            eprintln!(
-                "missing censor configuration for {} file(s) (--list to see them)",
-                index.len()
-            );
-        }
+            if !missing.is_empty() {
+                eprintln!(
+                    "Missing censor configuration for {} file(s) (--list to see them)",
+                    missing.len()
+                );
+            }
 
-        for (path, (config_path, dest_root, file)) in index {
-            if list {
+            if !silenced.is_empty() {
+                eprintln!(
+                    "Silenced censor configuration for {} file(s) (--list to see them)",
+                    silenced.len()
+                );
+            }
+        } else {
+            for (path, (config_path, ..)) in &missing {
                 eprintln!(
                     "{}: missing config for: {}",
                     config_path.display(),
@@ -597,6 +591,16 @@ fn main() -> Result<(), failure::Error> {
                 );
             }
 
+            for (path, (config_path, ..)) in &silenced {
+                eprintln!(
+                    "{}: silenced config for: {}",
+                    config_path.display(),
+                    path.display()
+                );
+            }
+        }
+
+        for (path, (_, dest_root, file)) in missing.into_iter().chain(silenced.into_iter()) {
             let dest = dest_root.join(
                 path.file_name()
                     .and_then(|n| n.to_str())
@@ -604,7 +608,7 @@ fn main() -> Result<(), failure::Error> {
             );
 
             modified.insert(file.to_owned());
-            tasks.push(Task::ProcessSilent(path, dest));
+            tasks.push(Task::Silence(path, dest));
         }
     }
 

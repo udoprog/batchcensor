@@ -1,4 +1,6 @@
-#[derive(Debug, PartialEq, Eq)]
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pos {
     pub hours: u32,
     pub minutes: u32,
@@ -50,6 +52,25 @@ impl Pos {
             seconds,
             milliseconds,
         })
+    }
+}
+
+impl fmt::Display for Pos {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.hours > 0 {
+            write!(fmt, "{:02}:", self.hours)?;
+        }
+
+        if self.minutes > 0 {
+            write!(fmt, "{:02}:", self.hours)?;
+        }
+
+        if self.seconds > 0 {
+            write!(fmt, "{:02}", self.seconds)?;
+        }
+
+        write!(fmt, ".{:03}", self.milliseconds)?;
+        Ok(())
     }
 }
 

@@ -1,10 +1,12 @@
 use crate::{Range, Replace};
 
 /// A parsed stranscript.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transcript {
     pub text: String,
     pub replace: Vec<Replace>,
+    /// Marked words without a timestamp.
+    pub missing: Vec<String>,
 }
 
 impl Transcript {
@@ -12,11 +14,21 @@ impl Transcript {
         let mut it = text.chars();
 
         let mut replace = Vec::new();
+        let mut missing = Vec::new();
 
         while let Some(c) = it.next() {
             match c {
                 '[' => {
-                    replace.push(Self::parse_replace(&mut it)?);
+                    let (word, range) = Self::parse_replace(&mut it)?;
+
+                    match range {
+                        Some(range) => {
+                            replace.push(Replace { word, range });
+                        }
+                        None => {
+                            missing.push(word);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -25,18 +37,21 @@ impl Transcript {
         Ok(Transcript {
             text: text.to_string(),
             replace,
+            missing,
         })
     }
 
     /// Parse a single replacement: [word]{range}.
-    pub fn parse_replace(it: &mut impl Iterator<Item = char>) -> Result<Replace, failure::Error> {
-        let mut kind = None;
+    pub fn parse_replace(
+        it: &mut impl Iterator<Item = char>,
+    ) -> Result<(String, Option<Range>), failure::Error> {
+        let mut word = None;
         let mut buffer = String::new();
 
         while let Some(c) = it.next() {
             match c {
                 ']' => {
-                    kind = Some(buffer);
+                    word = Some(buffer);
                     break;
                 }
                 c => {
@@ -45,17 +60,17 @@ impl Transcript {
             }
         }
 
-        let kind = match kind {
-            Some(kind) => kind,
+        let word = match word {
+            Some(word) => word,
             None => {
-                failure::bail!("missing kind");
+                failure::bail!("missing word");
             }
         };
 
         let open = it.next();
 
         if open != Some('{') {
-            failure::bail!("expected opening brace but got: {:?}", open);
+            return Ok((word, None));
         }
 
         let mut range = None;
@@ -82,7 +97,7 @@ impl Transcript {
 
         let range = Range::parse(&range).ok_or_else(|| failure::format_err!("bad range"))?;
 
-        Ok(Replace { kind, range })
+        Ok((word, Some(range)))
     }
 }
 
@@ -106,14 +121,14 @@ mod tests {
         let transcript = Transcript::parse("foo [bar]{01.123-$} [baz]{^-$}")?;
 
         let a = Replace {
-            kind: String::from("bar"),
+            word: String::from("bar"),
             range: Range::parse("01.123-$").expect("valid range"),
         };
 
         assert_eq!(a, transcript.replace[0]);
 
         let b = Replace {
-            kind: String::from("baz"),
+            word: String::from("baz"),
             range: Range::parse("^-$").expect("valid range"),
         };
 
