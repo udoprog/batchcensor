@@ -1,7 +1,7 @@
 use crate::Pos;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Range {
     pub start: Option<Pos>,
     pub end: Option<Pos>,
@@ -57,5 +57,14 @@ impl<'de> serde::Deserialize<'de> for Range {
     {
         let s: String = String::deserialize(deserializer)?;
         Range::parse(&s).ok_or_else(|| <D::Error as serde::de::Error>::custom("bad position"))
+    }
+}
+
+impl serde::Serialize for Range {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
     }
 }

@@ -1,4 +1,4 @@
-mod config;
+pub mod config;
 pub mod generator;
 mod pos;
 mod range;

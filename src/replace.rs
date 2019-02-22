@@ -1,7 +1,7 @@
 use crate::Range;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
 pub struct Replace {
     #[serde(rename = "kind")]
     pub word: String,

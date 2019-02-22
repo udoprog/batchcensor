@@ -1,7 +1,7 @@
 use crate::{Range, Replace};
 
 /// A parsed stranscript.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Transcript {
     pub text: String,
     pub replace: Vec<Replace>,
@@ -108,6 +108,15 @@ impl<'de> serde::Deserialize<'de> for Transcript {
     {
         let s: String = String::deserialize(deserializer)?;
         Transcript::parse(&s).map_err(|e| <D::Error as serde::de::Error>::custom(e.to_string()))
+    }
+}
+
+impl serde::Serialize for Transcript {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.text)
     }
 }
 

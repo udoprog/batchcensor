@@ -1,15 +1,18 @@
-use batchcensor::{generator, utils, Config, Generator, Pos, Replace};
+use batchcensor::{generator, utils, Config, Generator, Pos, Replace, Transcript};
 use failure::ResultExt;
-use relative_path::RelativePathBuf;
+use relative_path::{RelativePath, RelativePathBuf};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+struct Missing<'a>(&'a Path, &'a Path, &'a RelativePath);
 
 /// A single task that can be executed.
 pub enum Task<'a> {
@@ -105,6 +108,12 @@ fn opts() -> clap::App<'static, 'static> {
             clap::Arg::with_name("stats")
                 .long("stats")
                 .help("Show statistics about all configurations loaded."),
+        )
+        .arg(
+            clap::Arg::with_name("init")
+                .long("init")
+                .help("Initialize an existing configuration, complete with missing files.")
+                .takes_value(true),
         )
         .arg(
             clap::Arg::with_name("oiv-manifest")
@@ -372,6 +381,44 @@ fn write_oiv_manifest(
     }
 }
 
+/// Initialize missing files into the current set of configurations.
+fn do_init<'a>(
+    out: &mut impl io::Write,
+    missing: BTreeMap<PathBuf, Missing<'a>>,
+    mut configs: Vec<(&'a Path, &'a Path, Config)>,
+) -> Result<(), failure::Error> {
+    for m in missing {
+        for (root, config_path, config) in &mut configs {
+            if *config_path != (m.1).0 {
+                continue;
+            }
+
+            let (path, Missing(_, _, dir_path)) = m;
+
+            let path = path.strip_prefix(&root)?;
+
+            let mut c = path.components();
+            for _ in (&mut c).take(dir_path.components().count()) {}
+            let path = RelativePath::from_path(c.as_path())?;
+
+            let transcript = Transcript::parse("[missing]")?;
+            config.insert_file(dir_path, path.to_owned(), transcript)?;
+            break;
+        }
+    }
+
+    // optimize all configurations.
+    for (_, _, config) in &mut configs {
+        config.optimize()?;
+    }
+
+    for (_, _, config) in &configs {
+        serde_yaml::to_writer(&mut *out, &config)?;
+    }
+
+    return Ok(());
+}
+
 fn main() -> Result<(), failure::Error> {
     use rayon::prelude::*;
 
@@ -380,6 +427,7 @@ fn main() -> Result<(), failure::Error> {
     let stats = m.is_present("stats");
     let tone = m.is_present("tone");
     let output = m.value_of("output").map(PathBuf::from);
+    let init = m.value_of("init");
 
     let mut counts = BTreeMap::<String, u64>::new();
 
@@ -428,7 +476,7 @@ fn main() -> Result<(), failure::Error> {
                 })?,
             };
 
-            Ok((root, path, config))
+            Ok((root, path.as_path(), config))
         })
         .collect::<Result<Vec<_>, failure::Error>>()?;
 
@@ -437,8 +485,8 @@ fn main() -> Result<(), failure::Error> {
     // keep track if we are processing any files, which will determine what goes into the manifest.
     let mut modified = BTreeSet::new();
 
-    let mut missing = BTreeMap::new();
-    let mut silenced = BTreeMap::new();
+    let mut missing = BTreeMap::<PathBuf, Missing>::new();
+    let mut silenced = BTreeMap::<PathBuf, Missing>::new();
     let mut roots = HashMap::new();
     let mut dirs = HashMap::<PathBuf, Vec<_>>::new();
 
@@ -501,7 +549,7 @@ fn main() -> Result<(), failure::Error> {
             }
 
             // Keep track of all files to produce a list of files missing configuration in the end.
-            missing.insert(path, (config_path, dest_root, *dir_path));
+            missing.insert(path, Missing(config_path, dest_root, *dir_path));
         }
 
         // Process all dirs.
@@ -567,6 +615,32 @@ fn main() -> Result<(), failure::Error> {
         }
     }
 
+    if init.is_some() {
+        if missing.is_empty() {
+            println!("nothing to initialize: there are no missing files!");
+            return Ok(());
+        }
+
+        match init {
+            None | Some("-") => {
+                let out = io::stdout();
+                return do_init(&mut out.lock(), missing, configs.clone());
+            }
+            Some(other) => {
+                let other = Path::new(other);
+
+                let mut f = File::create(other).with_context(|_| {
+                    failure::format_err!(
+                        "failed to open init file for writing: {}",
+                        other.display()
+                    )
+                })?;
+
+                return do_init(&mut f, missing, configs.clone());
+            }
+        }
+    }
+
     if !missing.is_empty() || !silenced.is_empty() {
         if !list {
             if !missing.is_empty() {
@@ -583,7 +657,7 @@ fn main() -> Result<(), failure::Error> {
                 );
             }
         } else {
-            for (path, (config_path, ..)) in &missing {
+            for (path, Missing(config_path, ..)) in &missing {
                 eprintln!(
                     "{}: missing config for: {}",
                     config_path.display(),
@@ -591,7 +665,7 @@ fn main() -> Result<(), failure::Error> {
                 );
             }
 
-            for (path, (config_path, ..)) in &silenced {
+            for (path, Missing(config_path, ..)) in &silenced {
                 eprintln!(
                     "{}: silenced config for: {}",
                     config_path.display(),
@@ -600,7 +674,7 @@ fn main() -> Result<(), failure::Error> {
             }
         }
 
-        for (path, (_, dest_root, file)) in missing.into_iter().chain(silenced.into_iter()) {
+        for (path, Missing(_, dest_root, file)) in missing.into_iter().chain(silenced.into_iter()) {
             let dest = dest_root.join(
                 path.file_name()
                     .and_then(|n| n.to_str())
